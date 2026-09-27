@@ -155,7 +155,8 @@ func (db *DqliteDB) Bootstrap(extensions extensions.Extensions, addr *url.URL, c
 		dqlite.WithRolesAdjustmentHook(db.heartbeat),
 		dqlite.WithConcurrentLeaderConns(&db.maxConns),
 		dqlite.WithExternalConn(db.dialFunc(), db.acceptCh),
-		dqlite.WithUnixSocket(os.Getenv(sys.DqliteSocket)))
+		dqlite.WithUnixSocket(os.Getenv(sys.DqliteSocket)),
+		dqlite.WithLogFunc(db.dqliteLog()))
 	if err != nil {
 		return fmt.Errorf("Failed to bootstrap dqlite: %w", err)
 	}
@@ -206,7 +207,8 @@ func (db *DqliteDB) Join(extensions extensions.Extensions, addr *url.URL, joinAd
 		dqlite.WithAddress(db.listenAddr.Host),
 		dqlite.WithConcurrentLeaderConns(&db.maxConns),
 		dqlite.WithExternalConn(db.dialFunc(), db.acceptCh),
-		dqlite.WithUnixSocket(os.Getenv(sys.DqliteSocket)))
+		dqlite.WithUnixSocket(os.Getenv(sys.DqliteSocket)),
+		dqlite.WithLogFunc(db.dqliteLog()))
 	if err != nil {
 		return fmt.Errorf("Failed to join dqlite cluster %w", err)
 	}
@@ -345,6 +347,24 @@ func (db *DqliteDB) NotifyUpgraded() {
 	select {
 	case db.upgradeCh <- struct{}{}:
 	default:
+	}
+}
+
+// dqliteLog forwards go-dqlite's own messages (joining, role changes, leader
+// connection attempts) to the daemon's logger. Without it they are dropped.
+func (db *DqliteDB) dqliteLog() dqliteClient.LogFunc {
+	return func(level dqliteClient.LogLevel, format string, args ...any) {
+		msg := "Dqlite: " + fmt.Sprintf(format, args...)
+		switch level {
+		case dqliteClient.LogDebug:
+			db.log().Debug(msg)
+		case dqliteClient.LogInfo:
+			db.log().Info(msg)
+		case dqliteClient.LogWarn:
+			db.log().Warn(msg)
+		default:
+			db.log().Error(msg)
+		}
 	}
 }
 
