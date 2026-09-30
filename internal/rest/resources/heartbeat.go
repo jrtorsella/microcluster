@@ -128,6 +128,44 @@ func sendHeartbeats(ctx context.Context, logger *slog.Logger, clients types.Clie
 	return sent, nil
 }
 
+// updateMemberHeartbeats records the heartbeat time and dqlite role of each of the given cluster members, keyed by
+// address, in the database. Members not in the database are ignored.
+// It returns the old and new role of each member, keyed by name.
+func updateMemberHeartbeats(ctx context.Context, tx *sql.Tx, members map[string]types.ClusterMember) (map[string]types.RoleStatus, error) {
+	dbClusterMembers, err := cluster.GetCoreClusterMembers(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	roleStatusMap := make(map[string]types.RoleStatus, len(members))
+	for _, clusterMember := range dbClusterMembers {
+		heartbeatInfo, ok := members[clusterMember.Address]
+		if !ok {
+			continue
+		}
+
+		// Store role status for OnHeartbeat hook.
+		roleStatusMap[clusterMember.Name] = types.RoleStatus{
+			Old: string(clusterMember.Role),
+			New: heartbeatInfo.Role,
+		}
+
+		// Only write the columns a heartbeat changes, and only if they changed. Every row written adds to the raft
+		// log entry for this transaction, which every node replicates and retains.
+		role := cluster.Role(heartbeatInfo.Role)
+		if clusterMember.Role == role && clusterMember.Heartbeat.Equal(heartbeatInfo.LastHeartbeat) {
+			continue
+		}
+
+		err = cluster.UpdateCoreClusterMemberHeartbeat(ctx, tx, clusterMember.ID, heartbeatInfo.LastHeartbeat, role)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return roleStatusMap, nil
+}
+
 // beginHeartbeat initiates a heartbeat from the leader node to all other cluster members, if we haven't sent one out
 // recently.
 func beginHeartbeat(ctx context.Context, s types.State, hbReq types.HeartbeatInfo) types.Response {
@@ -246,31 +284,12 @@ func beginHeartbeat(ctx context.Context, s types.State, hbReq types.HeartbeatInf
 	}
 
 	// Having sent a heartbeat to each valid cluster member, update the database record of members.
-	roleStatusMap := map[string]types.RoleStatus{}
+	var roleStatusMap map[string]types.RoleStatus
 	err = s.Database().Transaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		dbClusterMembers, err := cluster.GetCoreClusterMembers(ctx, tx)
+		var err error
+		roleStatusMap, err = updateMemberHeartbeats(ctx, tx, hbInfo.ClusterMembers)
 		if err != nil {
 			return err
-		}
-
-		for _, clusterMember := range dbClusterMembers {
-			heartbeatInfo, ok := hbInfo.ClusterMembers[clusterMember.Address]
-			if !ok {
-				continue
-			}
-
-			// Store role status for OnHeartbeat hook.
-			roleStatusMap[clusterMember.Name] = types.RoleStatus{
-				Old: string(clusterMember.Role),
-				New: heartbeatInfo.Role,
-			}
-
-			clusterMember.Heartbeat = heartbeatInfo.LastHeartbeat
-			clusterMember.Role = cluster.Role(heartbeatInfo.Role)
-			err = cluster.UpdateCoreClusterMember(ctx, tx, clusterMember.Name, clusterMember)
-			if err != nil {
-				return err
-			}
 		}
 
 		return cluster.DeleteExpiredCoreTokenRecords(ctx, tx)

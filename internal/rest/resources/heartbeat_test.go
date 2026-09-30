@@ -2,17 +2,24 @@ package resources
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"testing"
 	"time"
 
+	"github.com/canonical/lxd/shared/api"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/require"
 
+	"github.com/canonical/microcluster/v4/internal/cluster"
+	"github.com/canonical/microcluster/v4/internal/db/update"
+	clusterDB "github.com/canonical/microcluster/v4/microcluster/db"
 	"github.com/canonical/microcluster/v4/microcluster/types"
 )
 
@@ -85,4 +92,105 @@ func TestSendHeartbeats(t *testing.T) {
 		require.False(t, lastHeartbeat.Before(before), "Heartbeat time for %q is before the round began", addr)
 		require.True(t, hbInfo.ClusterMembers[addr].LastHeartbeat.IsZero(), "Cluster member %q was modified while sending heartbeats", addr)
 	}
+}
+
+// Ensures updateMemberHeartbeats writes only the heartbeat and role, and only for members where either changed.
+func TestUpdateMemberHeartbeats(t *testing.T) {
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Each connection to an in-memory database gets its own database, and total_changes() is per connection.
+	db.SetMaxOpenConns(1)
+
+	_, err = update.NewSchema().Schema().Ensure(ctx, db)
+	require.NoError(t, err)
+
+	err = clusterDB.PrepareStmts(db, false)
+	require.NoError(t, err)
+
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	lastRound := time.Now().Add(-time.Minute)
+	for i := range 4 {
+		_, err = cluster.CreateCoreClusterMember(ctx, tx, cluster.CoreClusterMember{
+			Name:           fmt.Sprintf("member-%d", i),
+			Address:        fmt.Sprintf("10.0.0.%d:8443", i),
+			Certificate:    fmt.Sprintf("test-cert-%d", i),
+			SchemaInternal: 1,
+			SchemaExternal: 1,
+			Heartbeat:      lastRound,
+			Role:           "voter",
+		})
+		require.NoError(t, err)
+	}
+
+	before, err := cluster.GetCoreClusterMembers(ctx, tx)
+	require.NoError(t, err)
+
+	// Build the heartbeat record from the database, as beginHeartbeat does.
+	members := map[string]types.ClusterMember{}
+	for _, member := range before {
+		members[member.Address] = types.ClusterMember{
+			ClusterMemberLocal: types.ClusterMemberLocal{Name: member.Name},
+			Role:               string(member.Role),
+			LastHeartbeat:      member.Heartbeat,
+		}
+	}
+
+	now := time.Now()
+
+	// member-0 was sent a heartbeat.
+	member := members["10.0.0.0:8443"]
+	member.LastHeartbeat = now
+	members["10.0.0.0:8443"] = member
+
+	// member-1 was not sent a heartbeat, but changed role.
+	member = members["10.0.0.1:8443"]
+	member.Role = "spare"
+	members["10.0.0.1:8443"] = member
+
+	// member-2 is unchanged, and member-3 is not part of this heartbeat round.
+	delete(members, "10.0.0.3:8443")
+
+	var changesBefore, changesAfter int
+	err = tx.QueryRowContext(ctx, "SELECT total_changes()").Scan(&changesBefore)
+	require.NoError(t, err)
+
+	roleStatusMap, err := updateMemberHeartbeats(ctx, tx, members)
+	require.NoError(t, err)
+
+	err = tx.QueryRowContext(ctx, "SELECT total_changes()").Scan(&changesAfter)
+	require.NoError(t, err)
+
+	require.Equal(t, 2, changesAfter-changesBefore, "Unexpected number of rows written")
+	require.Equal(t, map[string]types.RoleStatus{
+		"member-0": {Old: "voter", New: "voter"},
+		"member-1": {Old: "voter", New: "spare"},
+		"member-2": {Old: "voter", New: "voter"},
+	}, roleStatusMap)
+
+	after, err := cluster.GetCoreClusterMembers(ctx, tx)
+	require.NoError(t, err)
+	require.Len(t, after, len(before))
+
+	for i := range after {
+		expected := before[i]
+		switch expected.Name {
+		case "member-0":
+			require.True(t, after[i].Heartbeat.Equal(now), "Heartbeat of %q was not updated", expected.Name)
+			expected.Heartbeat = after[i].Heartbeat
+		case "member-1":
+			expected.Role = "spare"
+		}
+
+		require.Equal(t, expected, after[i])
+	}
+
+	err = cluster.UpdateCoreClusterMemberHeartbeat(ctx, tx, -1, now, "voter")
+	require.True(t, api.StatusErrorCheck(err, http.StatusNotFound), "Expected not found error, got: %v", err)
 }
