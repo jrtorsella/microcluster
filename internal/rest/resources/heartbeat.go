@@ -84,6 +84,50 @@ func heartbeatPost(s types.State, r *http.Request) types.Response {
 	return types.EmptySyncResponse
 }
 
+// sendHeartbeats concurrently sends hbInfo to each of the given clients, skipping members that are not in
+// hbInfo.ClusterMembers (pending) or that were sent a heartbeat within the heartbeat interval.
+// It returns the time at which each member was successfully sent a heartbeat, keyed by address.
+//
+// Each send encodes hbInfo.ClusterMembers, so the map is only read here; callers should apply the returned
+// times to it once all sends have completed.
+func sendHeartbeats(ctx context.Context, logger *slog.Logger, clients types.Clients, hbInfo types.HeartbeatInfo, heartbeatInterval time.Duration, send func(ctx context.Context, c types.Client, hbInfo types.HeartbeatInfo) error) (map[string]time.Time, error) {
+	sentLock := sync.Mutex{}
+	sent := make(map[string]time.Time, len(clients))
+	err := clients.Query(ctx, true, func(ctx context.Context, c types.Client) error {
+		addr := c.URL().Host
+
+		currentMember, ok := hbInfo.ClusterMembers[addr]
+		if !ok {
+			logger.Warn(fmt.Sprintf("Skipping heartbeat cluster member record with address %v due to pending status", addr))
+			return nil
+		}
+
+		// If we sent a heartbeat to this node within the heartbeat interval, then we can skip the node this round.
+		timeSinceLast := time.Since(currentMember.LastHeartbeat)
+		if timeSinceLast < heartbeatInterval {
+			logger.Warn(fmt.Sprintf("Skipping heartbeat to %q, one was sent %q ago", currentMember.Name, timeSinceLast.String()))
+			return nil
+		}
+
+		err := send(ctx, c, hbInfo)
+		if err != nil {
+			logger.Error("Received error sending heartbeat to cluster member", slog.String("target", addr), slog.String("error", err.Error()))
+			return nil
+		}
+
+		sentLock.Lock()
+		sent[addr] = time.Now()
+		sentLock.Unlock()
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return sent, nil
+}
+
 // beginHeartbeat initiates a heartbeat from the leader node to all other cluster members, if we haven't sent one out
 // recently.
 func beginHeartbeat(ctx context.Context, s types.State, hbReq types.HeartbeatInfo) types.Response {
@@ -189,43 +233,16 @@ func beginHeartbeat(ctx context.Context, s types.State, hbReq types.HeartbeatInf
 		return types.SmartError(err)
 	}
 
-	// Use a lock to handle concurrent access to hbInfo.
-	mapLock := sync.RWMutex{}
 	// Send heartbeat to non-leader members, updating their local member cache and updating the node.
-	// If we sent a heartbeat to this node within double the request timeout, then we can skip the node this round.
-	err = clusterClients.Query(ctx, true, func(ctx context.Context, c types.Client) error {
-		addr := c.URL().Host
-
-		mapLock.RLock()
-		currentMember, ok := hbInfo.ClusterMembers[addr]
-		mapLock.RUnlock()
-		if !ok {
-			logger.Warn(fmt.Sprintf("Skipping heartbeat cluster member record with address %v due to pending status", addr))
-			return nil
-		}
-
-		timeSinceLast := time.Since(currentMember.LastHeartbeat)
-		if timeSinceLast < time.Duration(intState.InternalDatabase.GetHeartbeatInterval()) {
-			logger.Warn(fmt.Sprintf("Skipping heartbeat to %q, one was sent %q ago", currentMember.Name, timeSinceLast.String()))
-			return nil
-		}
-
-		err := intState.InternalDatabase.SendHeartbeat(ctx, c, hbInfo)
-		if err != nil {
-			logger.Error("Received error sending heartbeat to cluster member", slog.String("target", addr), slog.String("error", err.Error()))
-			return nil
-		}
-
-		currentMember.LastHeartbeat = time.Now()
-
-		mapLock.Lock()
-		hbInfo.ClusterMembers[addr] = currentMember
-		mapLock.Unlock()
-
-		return nil
-	})
+	sentHeartbeats, err := sendHeartbeats(ctx, logger, clusterClients, hbInfo, intState.InternalDatabase.GetHeartbeatInterval(), intState.InternalDatabase.SendHeartbeat)
 	if err != nil {
 		return types.SmartError(err)
+	}
+
+	for addr, lastHeartbeat := range sentHeartbeats {
+		currentMember := hbInfo.ClusterMembers[addr]
+		currentMember.LastHeartbeat = lastHeartbeat
+		hbInfo.ClusterMembers[addr] = currentMember
 	}
 
 	// Having sent a heartbeat to each valid cluster member, update the database record of members.
