@@ -1,6 +1,7 @@
 package trust
 
 import (
+	"bytes"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -169,7 +170,7 @@ func (r *Remotes) Replace(dir string, newRemotes ...types.ClusterMember) error {
 			return fmt.Errorf("Failed to parse local record %q. Found empty certificate", remote.Name)
 		}
 
-		bytes, err := yaml.Marshal(newRemote)
+		content, err := yaml.Marshal(newRemote)
 		if err != nil {
 			return fmt.Errorf("Failed to parse remote %q to yaml: %w", remote.Name, err)
 		}
@@ -179,12 +180,21 @@ func (r *Remotes) Replace(dir string, newRemotes ...types.ClusterMember) error {
 			return err
 		}
 
-		err = renameio.WriteFile(remotePath, bytes, 0644)
+		remoteData[remote.Name] = newRemote
+
+		// Leave a file that already holds this record alone. Every heartbeat replaces the remotes with the
+		// full member list, which is almost always the one already on disk; writing it regardless costs a
+		// synced write per cluster member on every member, and each write makes the truststore watcher
+		// reload the whole directory.
+		existing, err := os.ReadFile(remotePath)
+		if err == nil && bytes.Equal(existing, content) {
+			continue
+		}
+
+		err = renameio.WriteFile(remotePath, content, 0644)
 		if err != nil {
 			return fmt.Errorf("Failed to write %q: %w", remotePath, err)
 		}
-
-		remoteData[remote.Name] = newRemote
 	}
 
 	allEntries, err := os.ReadDir(dir)
